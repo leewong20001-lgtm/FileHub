@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: file-transfer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --timeout 300

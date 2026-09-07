@@ -1,0 +1,379 @@
+import json
+import os
+import secrets
+import threading
+import time
+from datetime import datetime
+
+from flask import Flask, abort, jsonify, render_template_string, request, send_file
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
+
+# Render 免費方案的磁碟是暫存的，放在 /tmp 即可
+if os.name == "nt":
+    STORAGE_DIR = os.path.join(os.environ.get("TEMP", os.getcwd()), "file_transfer_storage")
+else:
+    STORAGE_DIR = os.environ.get("STORAGE_DIR", "/tmp/file_transfer_storage")
+os.makedirs(STORAGE_DIR, exist_ok=True)
+
+META_PATH = os.path.join(STORAGE_DIR, "meta.json")
+TTL_SECONDS = 24 * 60 * 60      # 檔案保留 24 小時
+MAX_DOWNLOADS = 3               # 最多下載 3 次後自動刪除
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 去掉易混淆字元
+
+_lock = threading.Lock()
+
+
+def _load_meta():
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_meta(meta):
+    tmp = META_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    os.replace(tmp, META_PATH)
+
+
+def _cleanup(meta):
+    """刪除過期或超過下載次數的檔案。"""
+    now = time.time()
+    changed = False
+    for code in list(meta.keys()):
+        m = meta[code]
+        if now > m["expires_at"] or m["downloads"] >= MAX_DOWNLOADS:
+            try:
+                os.remove(os.path.join(STORAGE_DIR, code + ".bin"))
+            except OSError:
+                pass
+            del meta[code]
+            changed = True
+    if changed:
+        _save_meta(meta)
+    return meta
+
+
+def _new_code(meta):
+    while True:
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
+        if code not in meta:
+            return code
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify(error="檔案超過 100 MB 上限"), 413
+
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE_HTML)
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="沒有收到檔案"), 400
+    with _lock:
+        meta = _cleanup(_load_meta())
+        code = _new_code(meta)
+        f.save(os.path.join(STORAGE_DIR, code + ".bin"))
+        meta[code] = {
+            "filename": os.path.basename(f.filename),
+            "size": os.path.getsize(os.path.join(STORAGE_DIR, code + ".bin")),
+            "downloads": 0,
+            "expires_at": time.time() + TTL_SECONDS,
+        }
+        _save_meta(meta)
+    return jsonify(code=code)
+
+
+@app.route("/info/<code>")
+def info(code):
+    code = code.strip().upper()
+    with _lock:
+        meta = _cleanup(_load_meta())
+        m = meta.get(code)
+    if not m or not os.path.exists(os.path.join(STORAGE_DIR, code + ".bin")):
+        return jsonify(error="找不到這組提取碼，檔案可能已過期或被下載完畢"), 404
+    remaining = MAX_DOWNLOADS - m["downloads"]
+    return jsonify(
+        filename=m["filename"],
+        size=m["size"],
+        remaining_downloads=remaining,
+        expires=datetime.fromtimestamp(m["expires_at"]).strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+@app.route("/d/<code>")
+def download(code):
+    code = code.strip().upper()
+    with _lock:
+        meta = _cleanup(_load_meta())
+        m = meta.get(code)
+    if not m or not os.path.exists(os.path.join(STORAGE_DIR, code + ".bin")):
+        abort(404)
+    with _lock:
+        meta = _load_meta()
+        if code in meta:
+            meta[code]["downloads"] += 1
+            _save_meta(meta)
+    return send_file(
+        os.path.join(STORAGE_DIR, code + ".bin"),
+        as_attachment=True,
+        download_name=m["filename"],
+    )
+
+
+PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>檔案中繼站</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif;
+    background: #f2f4f8; color: #1f2933; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: #fff; border-radius: 12px; padding: 32px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.08); width: 100%; max-width: 480px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #6b7785; font-size: 13px; margin-bottom: 20px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tab {
+    flex: 1; padding: 10px; border: 1px solid #d5dbe3; background: #fff;
+    border-radius: 8px; cursor: pointer; font-size: 14px; color: #52606d;
+  }
+  .tab.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .dropzone {
+    border: 2px dashed #c3ccd6; border-radius: 10px; padding: 36px 16px;
+    text-align: center; color: #6b7785; cursor: pointer; font-size: 14px;
+    transition: border-color .15s, background .15s;
+  }
+  .dropzone:hover, .dropzone.drag { border-color: #2563eb; background: #eff6ff; }
+  .dropzone input { display: none; }
+  .filename { margin-top: 12px; font-size: 14px; color: #1f2933; word-break: break-all; }
+  .bar { height: 8px; background: #e4e9f0; border-radius: 4px; margin-top: 14px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: #2563eb; transition: width .2s; }
+  .status { margin-top: 8px; font-size: 13px; color: #6b7785; min-height: 18px; }
+  .status.err { color: #d0342c; }
+  button.primary {
+    margin-top: 16px; width: 100%; padding: 12px; border: 0; border-radius: 8px;
+    background: #2563eb; color: #fff; font-size: 15px; cursor: pointer;
+  }
+  button.primary:disabled { background: #9db4e8; cursor: not-allowed; }
+  .result { margin-top: 20px; display: none; text-align: center; }
+  .code {
+    font-size: 32px; letter-spacing: 8px; font-weight: 700; color: #1f2933;
+    background: #f2f4f8; border-radius: 8px; padding: 12px; margin: 10px 0;
+  }
+  .link {
+    font-size: 13px; color: #2563eb; word-break: break-all; margin: 8px 0;
+  }
+  .copy {
+    margin-top: 8px; padding: 8px 16px; border: 1px solid #d5dbe3; background: #fff;
+    border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  .copy:active { background: #eff6ff; }
+  input.codeinput {
+    width: 100%; padding: 14px; font-size: 24px; letter-spacing: 8px; text-align: center;
+    text-transform: uppercase; border: 1px solid #d5dbe3; border-radius: 8px; outline: none;
+  }
+  input.codeinput:focus { border-color: #2563eb; }
+  .fileinfo {
+    margin-top: 16px; padding: 14px; background: #f2f4f8; border-radius: 8px;
+    font-size: 14px; display: none; line-height: 1.8;
+  }
+  .fileinfo b { word-break: break-all; }
+  .note { margin-top: 20px; font-size: 12px; color: #9aa5b1; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>檔案中繼站</h1>
+  <div class="sub">跨網路傳檔：一台電腦上傳，另一台用提取碼下載</div>
+
+  <div class="tabs">
+    <button class="tab active" id="tab-up" onclick="switchTab('up')">上傳檔案</button>
+    <button class="tab" id="tab-dl" onclick="switchTab('dl')">下載檔案</button>
+  </div>
+
+  <div class="panel active" id="panel-up">
+    <div class="dropzone" id="dropzone" onclick="document.getElementById('fileinput').click()">
+      點擊選擇檔案，或把檔案拖進來<br><span style="font-size:12px">上限 100 MB</span>
+      <input type="file" id="fileinput">
+    </div>
+    <div class="filename" id="filename"></div>
+    <div class="bar" id="bar" style="display:none"><div id="barfill"></div></div>
+    <div class="status" id="upstatus"></div>
+    <button class="primary" id="uploadbtn" disabled onclick="doUpload()">上傳並取得提取碼</button>
+
+    <div class="result" id="result">
+      <div style="font-size:13px;color:#6b7785">提取碼（24 小時內有效，可下載 3 次）</div>
+      <div class="code" id="showcode"></div>
+      <div class="link" id="showlink"></div>
+      <button class="copy" onclick="copyLink()">複製下載連結</button>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-dl">
+    <input class="codeinput" id="dlcode" maxlength="6" placeholder="輸入提取碼" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')">
+    <button class="primary" id="checkbtn" onclick="checkCode()">查詢檔案</button>
+    <div class="status" id="dlstatus"></div>
+    <div class="fileinfo" id="fileinfo"></div>
+    <button class="primary" id="dlbtn" style="display:none" onclick="doDownload()">下載檔案</button>
+  </div>
+
+  <div class="note">注意：檔案存放在伺服器暫存空間，24 小時或下載 3 次後自動刪除。請上傳後盡快下載，不要當作長期保存空間。</div>
+</div>
+
+<script>
+let pickedFile = null;
+let currentUrl = "";
+let currentCode = "";
+
+function switchTab(t) {
+  document.getElementById("panel-up").classList.toggle("active", t === "up");
+  document.getElementById("panel-dl").classList.toggle("active", t === "dl");
+  document.getElementById("tab-up").classList.toggle("active", t === "up");
+  document.getElementById("tab-dl").classList.toggle("active", t === "dl");
+}
+
+const dz = document.getElementById("dropzone");
+const fi = document.getElementById("fileinput");
+dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("drag"); });
+dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+dz.addEventListener("drop", e => {
+  e.preventDefault(); dz.classList.remove("drag");
+  if (e.dataTransfer.files.length) pickFile(e.dataTransfer.files[0]);
+});
+fi.addEventListener("change", () => { if (fi.files.length) pickFile(fi.files[0]); });
+
+function pickFile(f) {
+  if (f.size > 100 * 1024 * 1024) {
+    setStatus("upstatus", "檔案超過 100 MB 上限", true);
+    return;
+  }
+  pickedFile = f;
+  document.getElementById("filename").textContent = f.name + "（" + fmtSize(f.size) + "）";
+  document.getElementById("uploadbtn").disabled = false;
+  document.getElementById("result").style.display = "none";
+}
+
+function doUpload() {
+  if (!pickedFile) return;
+  const fd = new FormData();
+  fd.append("file", pickedFile);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/upload");
+  document.getElementById("bar").style.display = "block";
+  document.getElementById("uploadbtn").disabled = true;
+  setStatus("upstatus", "上傳中...");
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      const pct = Math.round(e.loaded / e.total * 100);
+      document.getElementById("barfill").style.width = pct + "%";
+      setStatus("upstatus", "上傳中 " + pct + "%");
+    }
+  };
+  xhr.onload = () => {
+    document.getElementById("bar").style.display = "none";
+    if (xhr.status === 200) {
+      const data = JSON.parse(xhr.responseText);
+      currentCode = data.code;
+      currentUrl = location.origin + "/d/" + data.code;
+      document.getElementById("showcode").textContent = data.code;
+      document.getElementById("showlink").textContent = currentUrl;
+      document.getElementById("result").style.display = "block";
+      setStatus("upstatus", "上傳完成。把提取碼或連結給另一台電腦即可下載。");
+      document.getElementById("uploadbtn").disabled = false;
+    } else {
+      let msg = "上傳失敗（" + xhr.status + "）";
+      try { msg = JSON.parse(xhr.responseText).error || msg; } catch (e) {}
+      setStatus("upstatus", msg, true);
+      document.getElementById("uploadbtn").disabled = false;
+    }
+  };
+  xhr.onerror = () => {
+    document.getElementById("bar").style.display = "none";
+    setStatus("upstatus", "網路錯誤，請重試", true);
+    document.getElementById("uploadbtn").disabled = false;
+  };
+  xhr.send(fd);
+}
+
+function copyLink() {
+  navigator.clipboard.writeText(currentUrl).then(() => {
+    setStatus("upstatus", "已複製下載連結");
+  });
+}
+
+function checkCode() {
+  const code = document.getElementById("dlcode").value.trim().toUpperCase();
+  if (code.length !== 6) { setStatus("dlstatus", "提取碼必須是 6 個字元", true); return; }
+  setStatus("dlstatus", "查詢中...");
+  fetch("/info/" + code).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+    if (!ok) { setStatus("dlstatus", d.error || "查無此檔案", true); hideInfo(); return; }
+    setStatus("dlstatus", "");
+    const box = document.getElementById("fileinfo");
+    box.innerHTML = "<b>" + esc(d.filename) + "</b><br>" +
+      "大小：" + fmtSize(d.size) + "<br>" +
+      "剩餘下載次數：" + d.remaining_downloads + "<br>" +
+      "有效期限：" + d.expires;
+    box.style.display = "block";
+    const btn = document.getElementById("dlbtn");
+    btn.style.display = "block";
+    currentCode = code;
+  }).catch(() => setStatus("dlstatus", "網路錯誤，請重試", true));
+}
+
+function doDownload() {
+  window.location.href = "/d/" + currentCode;
+}
+
+function hideInfo() {
+  document.getElementById("fileinfo").style.display = "none";
+  document.getElementById("dlbtn").style.display = "none";
+}
+
+function setStatus(id, msg, isErr) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.classList.toggle("err", !!isErr);
+}
+
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+document.getElementById("dlcode").addEventListener("keydown", e => {
+  if (e.key === "Enter") checkCode();
+});
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
